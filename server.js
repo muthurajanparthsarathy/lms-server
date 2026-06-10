@@ -62,7 +62,7 @@ app.use('/Developers Backup/LMS', express.static('\\\\192.168.1.4\\Developers Ba
 // Init Middleware
 app.use(express.json({ extended: false }));
 app.use(cors({
-  origin: ["https://lms-smartcliff-71ug4ew5q-muthurajanparthsarathys-projects.vercel.app", "http://localhost:3001", "http://localhost:3002"],
+  origin: ["https://lms-smartcliff.vercel.app", "https://lms-smartcliff-71ug4ew5q-muthurajanparthsarathys-projects.vercel.app", "http://localhost:3000","http://localhost:3001", "http://localhost:3002"],
   methods: ["GET", "POST", "PUT", "DELETE","PATCH"],
   credentials: true,
   exposedHeaders: ["Content-Length", "Authorization"],
