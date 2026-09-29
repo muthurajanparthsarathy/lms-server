@@ -116,97 +116,43 @@ async function cloneQuestionsToBank({ institutionId, exerciseId, questions, acto
   }
 }
 
-/**
- * Port of the client-side `isAssessmentComplete` — same rules, same order.
- * Called on the raw exercise sub-doc as it lives inside pedagogy.
- */
-const isExerciseFullyConfigured = (ex) => {
-  if (!ex) return false;
-  if (!ex.exerciseType) return false;
-  const info = ex.exerciseInformation || {};
-  if (!info.exerciseName || !String(info.exerciseName).trim()) return false;
-  if (!ex.availabilityPeriod || !ex.availabilityPeriod.startDate) return false;
-  // Non-graded exercises (isGraded === false) legitimately carry totalMarks=0,
-  // so the marks requirement only applies to graded ones. Without this guard
-  // every non-graded We_Do/You_Do item is stuck "not fully configured" — hidden
-  // from the approvals overview and its step-1 notification never fires.
-  if (ex.isGraded !== false
-      && (info.totalMarks ?? 0) <= 0 && (info.totalMarksMCQ ?? 0) <= 0) return false;
+// Moved to utils/exerciseReadiness.js so the node models' save hook
+// (utils/assignmentStudentNotify.js) applies the very same rule.
+const { isExerciseFullyConfigured } = require("../../../utils/exerciseReadiness");
 
-  // Scope-aware baseline: for "settings_and_questions", questions are the
-  // whole point — an exercise with zero questions is by definition NOT
-  // fully configured, even if the trainer hasn't set a count yet. Without
-  // this guard the per-type checks below fall through when the configured
-  // count is 0/undefined, letting an empty exercise pass as "complete".
-  const scope = ex.availabilityPeriod?.approvalScope || 'settings';
-  const hasQuestions = Array.isArray(ex.questions) && ex.questions.length > 0;
-  if (scope === 'settings_and_questions' && !hasQuestions) return false;
+// ─── Hints & constraints as they arrive from the question forms ──────────────
+// Only entries with actual text are kept: an "Additional Hint" or constraint
+// row the author added but never filled in is not a hint/constraint. This used
+// to be `hintText: hint.hintText || hint`, so an EMPTY hint fell back to the
+// whole hint object as its text and the save died on "Cast to string failed".
+// Hints carry no points deduction any more; the schema field stays for old
+// rows but is always written as 0.
+const hintTextOf = (h) =>
+  (typeof h === 'string' ? h : typeof h?.hintText === 'string' ? h.hintText : '').trim();
 
-  // Section-based
-  if (ex.isSectionBased) {
-    const sectionConfigs = ex.sectionConfigs instanceof Map
-      ? Object.fromEntries(ex.sectionConfigs)
-      : (ex.sectionConfigs || {});
-    const allQuestions = ex.questions || [];
-    const countBySection = {};
-    allQuestions.forEach((q) => {
-      const sid = q.sectionId;
-      if (!sid) return;
-      if (!countBySection[sid]) countBySection[sid] = { mcq: 0, prog: 0 };
-      if (q.questionType === 'mcq') countBySection[sid].mcq++;
-      else if (['programming', 'database', 'others'].includes(q.questionType)) countBySection[sid].prog++;
-    });
-    for (const key of Object.keys(sectionConfigs)) {
-      const cfg = sectionConfigs[key] || {};
-      const sectionId = cfg.id || key;
-      const type = cfg.exerciseType || 'MCQ';
-      const c = countBySection[sectionId] || { mcq: 0, prog: 0 };
-      if (type === 'MCQ' || type === 'Combined') {
-        const limit = cfg.mcqConfig?.generalQuestionCount || 0;
-        if (limit > 0 && c.mcq < limit) return false;
-      }
-      if (type === 'Programming' || type === 'Combined') {
-        const pc = cfg.programmingConfig || {};
-        const lb = pc.levelBasedCounts || {};
-        const limit = pc.questionConfigType === 'general'
-          ? (pc.generalQuestionCount || 0)
-          : ((lb.easy || 0) + (lb.medium || 0) + (lb.hard || 0));
-        if (limit > 0 && c.prog < limit) return false;
-      }
-    }
-    return true;
-  }
+// Notification delivery channels ({ dashboard, gmail, whatsapp }). Each key
+// takes the incoming value when sent, else the stored one, else off.
+const pickChannels = (incoming, existing) => ({
+  dashboard: incoming?.dashboard ?? existing?.dashboard ?? false,
+  gmail: incoming?.gmail ?? existing?.gmail ?? false,
+  whatsapp: incoming?.whatsapp ?? existing?.whatsapp ?? false,
+});
 
-  // Non-section-based
-  const qc = ex.questionConfiguration || {};
-  const mcqCfg = qc.mcqQuestionConfiguration;
-  const progCfg = qc.programmingQuestionConfiguration;
-  const questions = ex.questions || [];
-  const mcqQs = questions.filter((q) => q.questionType === 'mcq');
-  const progQs = questions.filter((q) => ['programming', 'database', 'others'].includes(q.questionType));
+const normalizeHints = (hints, { keepIds = false } = {}) =>
+  (Array.isArray(hints) ? hints : [])
+    .map((h) => ({ h, text: hintTextOf(h) }))
+    .filter(({ text }) => text)
+    .map(({ h, text }, index) => ({
+      _id: (keepIds && h && typeof h === 'object' && h._id) || new mongoose.Types.ObjectId(),
+      hintText: text,
+      pointsDeduction: 0,
+      isPublic: h && typeof h === 'object' && h.isPublic !== undefined ? h.isPublic !== false : true,
+      sequence: index,
+    }));
 
-  if (ex.exerciseType === 'MCQ') {
-    const maxQ = mcqCfg?.totalMcqQuestions ?? 0;
-    if (maxQ > 0 && mcqQs.length < maxQ) return false;
-  } else if (ex.exerciseType === 'Programming') {
-    const ct = progCfg?.questionConfigType;
-    const lc = progCfg?.levelBasedCounts ?? progCfg?.selectionLevelCounts ?? {};
-    const maxQ = ct === 'general'
-      ? (progCfg?.generalQuestionCount ?? 0)
-      : ((lc.easy ?? 0) + (lc.medium ?? 0) + (lc.hard ?? 0));
-    if (maxQ > 0 && progQs.length < maxQ) return false;
-  } else if (ex.exerciseType === 'Combined') {
-    const ct = progCfg?.questionConfigType;
-    const lc = progCfg?.levelBasedCounts ?? progCfg?.selectionLevelCounts ?? {};
-    const progMax = ct === 'general'
-      ? (progCfg?.generalQuestionCount ?? 0)
-      : ((lc.easy ?? 0) + (lc.medium ?? 0) + (lc.hard ?? 0));
-    const maxQ = (mcqCfg?.totalMcqQuestions ?? 0) + progMax;
-    const curQ = mcqQs.length + progQs.length;
-    if (maxQ > 0 && curQ < maxQ) return false;
-  }
-  return true;
-};
+const normalizeConstraints = (constraints) =>
+  (Array.isArray(constraints) ? constraints : [])
+    .filter((c) => typeof c === 'string' && c.trim());
 
 // ─── Question quota enforcement ───────────────────────────────────────────────
 // The exercise configuration is the single source of truth for how many
@@ -475,6 +421,22 @@ const modelMap = {
 
 
 // Get a single exercise by ID - Return FULL exercise data
+// Does this (lean) node hold an exercise with `exerciseId` anywhere — in its
+// shared pedagogy or in any batch's bucket? A cheap in-memory pre-check so
+// the id-only lookup scopes just the matching node instead of every node.
+const PEDAGOGY_SECTIONS = ['I_Do', 'We_Do', 'You_Do'];
+const entriesOf = (v) => (v instanceof Map ? Array.from(v.entries()) : v && typeof v === 'object' ? Object.entries(v) : []);
+const containerHoldsExercise = (container, exerciseId) =>
+  PEDAGOGY_SECTIONS.some((section) =>
+    entriesOf(container?.[section]).some(([, list]) => {
+      const arr = Array.isArray(list) ? list : list?._id ? [list] : [];
+      return arr.some((ex) => ex?._id && ex._id.toString() === exerciseId);
+    })
+  );
+const nodeHoldsExercise = (node, exerciseId) =>
+  containerHoldsExercise(node?.pedagogy, exerciseId) ||
+  entriesOf(node?.batchPedagogy).some(([, bucket]) => containerHoldsExercise(bucket, exerciseId));
+
 exports.getExerciseById = async (req, res) => {
   try {
     const { exerciseId } = req.params;
@@ -575,21 +537,34 @@ exports.getExerciseById = async (req, res) => {
         { name: 'subtopics', model: SubTopic1, type: 'subtopic' }
       ];
 
-      for (const { model, type } of modelsToSearch) {
+      // Resources by Batch — `batchPedagogy` has to be in the filter as well
+      // as the walk. A node whose only content is batch-wise has NO
+      // `pedagogy` at all, so a `pedagogy: {$exists: true}` filter alone
+      // would skip it and this fallback would report the exercise as missing.
+      // The four levels are fetched in parallel instead of one after another.
+      const nodeFilter = {
+        $or: [
+          { 'pedagogy': { $exists: true, $ne: null } },
+          { 'batchPedagogy': { $exists: true, $ne: null } },
+        ],
+      };
+      const entitiesByModel = await Promise.all(
+        modelsToSearch.map(({ model, type }) =>
+          model.find(nodeFilter).lean().catch((err) => {
+            console.log(`Error searching in ${type}:`, err.message);
+            return [];
+          })
+        )
+      );
+
+      for (let mi = 0; mi < modelsToSearch.length; mi++) {
+        const { type } = modelsToSearch[mi];
         try {
-          // Search all entities with pedagogy.
-          //
-          // Resources by Batch — `batchPedagogy` has to be in the filter as
-          // well as the walk. A node whose only content is batch-wise has NO
-          // `pedagogy` at all, so the original `pedagogy: {$exists: true}`
-          // filter would skip it and this fallback would report the exercise
-          // as missing.
-          const entities = await model.find({
-            $or: [
-              { 'pedagogy': { $exists: true, $ne: null } },
-              { 'batchPedagogy': { $exists: true, $ne: null } },
-            ],
-          }).lean();
+          // Only the node(s) that actually hold this id go on to the batch
+          // scoping below — that step costs a course lookup per node, which
+          // across every node of a large course ran past the client's 30s
+          // timeout.
+          const entities = entitiesByModel[mi].filter((entity) => nodeHoldsExercise(entity, exerciseId));
 
           for (const entity of entities) {
             // Flatten the caller's batch onto `pedagogy` before walking, so
@@ -3467,18 +3442,8 @@ exports.addQuestion = async (req, res) => {
           sampleInput: questionData.sampleInput || '',
           sampleOutput: questionData.sampleOutput || '',
           score: questionData.score || 0,
-          constraints: Array.isArray(questionData.constraints) && questionData.constraints.length > 0
-            ? questionData.constraints.filter(c => c && c.trim())
-            : undefined,
-          hints: Array.isArray(questionData.hints) && questionData.hints.length > 0
-            ? questionData.hints.map((hint, index) => ({
-              _id: new mongoose.Types.ObjectId(),
-              hintText: hint.hintText || hint,
-              pointsDeduction: hint.pointsDeduction || 0,
-              isPublic: hint.isPublic !== undefined ? hint.isPublic : true,
-              sequence: hint.sequence || index
-            }))
-            : undefined,
+          constraints: normalizeConstraints(questionData.constraints),
+          hints: normalizeHints(questionData.hints),
           testCases: Array.isArray(questionData.testCases) && questionData.testCases.length > 0
             ? questionData.testCases.map((testCase, index) => ({
               _id: new mongoose.Types.ObjectId(),
@@ -3600,18 +3565,8 @@ exports.addQuestion = async (req, res) => {
           points: questionData.score || questionData.points || 0,
           isDatabase: true,
           moduleType: 'Database',
-          constraints: Array.isArray(questionData.constraints)
-            ? questionData.constraints.filter(c => c && c.trim())
-            : [],
-          hints: Array.isArray(questionData.hints) && questionData.hints.length > 0
-            ? questionData.hints.map((hint, index) => ({
-              _id: new mongoose.Types.ObjectId(),
-              hintText: hint.hintText || hint,
-              pointsDeduction: hint.pointsDeduction || 0,
-              isPublic: hint.isPublic !== undefined ? hint.isPublic : true,
-              sequence: hint.sequence || index,
-            }))
-            : undefined,
+          constraints: normalizeConstraints(questionData.constraints),
+          hints: normalizeHints(questionData.hints),
           // Code Setup — starterCode ships to the student attempt UI;
           // solutionCode is author-only (stripped for students by
           // testCaseVisibility.js on every pedagogy read).
@@ -4290,24 +4245,12 @@ if (updateData.source) {
 
       // Update constraints if provided
       if (updateData.constraints !== undefined) {
-        updatedQuestion.constraints = Array.isArray(updateData.constraints) && updateData.constraints.length > 0
-          ? updateData.constraints.filter(c => c && c.trim())
-          : undefined;
+        updatedQuestion.constraints = normalizeConstraints(updateData.constraints);
       }
 
       // Update hints if provided
       if (updateData.hints !== undefined) {
-        if (Array.isArray(updateData.hints) && updateData.hints.length > 0) {
-          updatedQuestion.hints = updateData.hints.map((hint, index) => ({
-            _id: hint._id || new mongoose.Types.ObjectId(),
-            hintText: hint.hintText || hint,
-            pointsDeduction: hint.pointsDeduction || 0,
-            isPublic: hint.isPublic !== undefined ? hint.isPublic : true,
-            sequence: hint.sequence || index
-          }));
-        } else {
-          updatedQuestion.hints = undefined;
-        }
+        updatedQuestion.hints = normalizeHints(updateData.hints, { keepIds: true });
       }
 
       // Update test cases if provided
@@ -4457,23 +4400,11 @@ if (updateData.source) {
       }
 
       if (updateData.constraints !== undefined) {
-        updatedQuestion.constraints = Array.isArray(updateData.constraints)
-          ? updateData.constraints.filter(c => c && c.trim())
-          : [];
+        updatedQuestion.constraints = normalizeConstraints(updateData.constraints);
       }
 
       if (updateData.hints !== undefined) {
-        if (Array.isArray(updateData.hints) && updateData.hints.length > 0) {
-          updatedQuestion.hints = updateData.hints.map((hint, index) => ({
-            _id: hint._id || new mongoose.Types.ObjectId(),
-            hintText: hint.hintText || hint,
-            pointsDeduction: hint.pointsDeduction || 0,
-            isPublic: hint.isPublic !== undefined ? hint.isPublic : true,
-            sequence: hint.sequence || index,
-          }));
-        } else {
-          updatedQuestion.hints = [];
-        }
+        updatedQuestion.hints = normalizeHints(updateData.hints, { keepIds: true });
       }
 
       // Code Setup — starterCode ships to the student attempt UI; solutionCode
@@ -9470,12 +9401,15 @@ exports.addYouDoExercise = async (req, res) => {
       const endDate = parseDate(period.endDate);
       const cutOffDate = period.cutOffEnabled ? parseDate(period.cutOffDate) : null;
       const gracePeriodDate = period.gracePeriodEnabled ? parseDate(period.gracePeriodDate) : null;
+      const remindGradeBy = period.remindGradeByEnabled ? parseDate(period.remindGradeBy) : null;
 
       return {
         startDate,
         endDate,
         cutOffDate,
         cutOffEnabled: period.cutOffEnabled || false,
+        remindGradeByEnabled: !!period.remindGradeByEnabled,
+        remindGradeBy,
         gracePeriodAllowed: period.gracePeriodEnabled || false,
         gracePeriodEnabled: period.gracePeriodEnabled || false,
         gracePeriodDate,
@@ -9521,6 +9455,11 @@ exports.addYouDoExercise = async (req, res) => {
       notifyGradersSubmissions: notifSettings.notifyGradersSubmissions || false,
       notifyGradersLateSubmissions: notifSettings.notifyGradersLateSubmissions || false,
       notifyStudent: notifSettings.notifyStudent !== undefined ? notifSettings.notifyStudent : true,
+      // Per-toggle delivery channels (Dashboard / Gmail / WhatsApp) — same
+      // shape the We_Do assignment stores.
+      notifyStudentChannels: pickChannels(notifSettings.notifyStudentChannels),
+      notifyGradersSubmissionsChannels: pickChannels(notifSettings.notifyGradersSubmissionsChannels),
+      notifyGradersLateSubmissionsChannels: pickChannels(notifSettings.notifyGradersLateSubmissionsChannels),
     };
 
     // ── Build gradeSettings ────────────────────────────────────────────────
@@ -10233,6 +10172,9 @@ exports.updateYouDoExercise = async (req, res) => {
         notifyGradersSubmissions: parsedNotifSettings.notifyGradersSubmissions !== undefined ? parsedNotifSettings.notifyGradersSubmissions : (ex.notifyGradersSubmissions ?? false),
         notifyGradersLateSubmissions: parsedNotifSettings.notifyGradersLateSubmissions !== undefined ? parsedNotifSettings.notifyGradersLateSubmissions : (ex.notifyGradersLateSubmissions ?? false),
         notifyStudent: parsedNotifSettings.notifyStudent !== undefined ? parsedNotifSettings.notifyStudent : (ex.notifyStudent ?? true),
+        notifyStudentChannels: pickChannels(parsedNotifSettings.notifyStudentChannels, ex.notifyStudentChannels),
+        notifyGradersSubmissionsChannels: pickChannels(parsedNotifSettings.notifyGradersSubmissionsChannels, ex.notifyGradersSubmissionsChannels),
+        notifyGradersLateSubmissionsChannels: pickChannels(parsedNotifSettings.notifyGradersLateSubmissionsChannels, ex.notifyGradersLateSubmissionsChannels),
       };
       updatedExercise.notificatonandGradeSettings = {
         notifyUsers: updatedExercise.notificationSettings.notifyUsers,
@@ -11040,7 +10982,12 @@ exports.approveExerciseStep = async (req, res) => {
         exerciseName: exercise.exerciseInformation?.exerciseName,
         exerciseId: exercise._id,
       }).catch((e) => console.warn('notifyApproversForStep failed:', e.message));
-    } else {
+    } else if (tabKey !== 'We_Do') {
+      // We Do assignments are announced by the node model's save hook
+      // (utils/assignmentStudentNotify.js) — the save just above flipped the
+      // workflow to approved, so it has already fired, scoped to the
+      // assignment's batch and honouring Notify Student + its channels.
+      // Calling this too would re-announce it to every batch of the course.
       notifyStudentsExerciseAvailable({
         courseId: courseIdForNotify,
         courseName: courseDoc?.courseName,

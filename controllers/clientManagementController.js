@@ -569,14 +569,13 @@ const validateContactPersons = (contactPersons) => {
         return { error: `Invalid secondary email format for ${person.name}` };
       }
       const secKey = secondaryEmailRaw.toLowerCase();
-      // A contact's own primary and secondary must not collide, and no other
-      // contact's primary may match either. Duplicates across secondaries of
-      // different people are fine — two contacts sharing a reception line is
-      // realistic and not the kind of duplicate the form is trying to prevent.
-      if (secKey === key) {
-        return { error: `Secondary email must differ from the primary email for ${person.name}` };
-      }
-      if (emailSet.has(secKey)) {
+      // A contact's secondary may equal their own primary — the form's
+      // "Same as primary" checkbox copies it down on purpose. It must not
+      // match another contact's primary, though. Duplicates across
+      // secondaries of different people are fine — two contacts sharing a
+      // reception line is realistic and not the kind of duplicate the form
+      // is trying to prevent.
+      if (secKey !== key && emailSet.has(secKey)) {
         return { error: `Duplicate email ${secondaryEmailRaw} in contact persons` };
       }
     }

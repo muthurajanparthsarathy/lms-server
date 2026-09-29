@@ -15,7 +15,31 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 })
 
-const SOFFICE = 'C:/Program Files/LibreOffice/program/soffice.exe'
+// Where LibreOffice lives differs per machine — a Windows dev box, a Mac, the
+// Linux server — so it is not one hard-coded path (that path failed with
+// ENOENT on any machine where LibreOffice sat elsewhere or was missing).
+// LIBREOFFICE_PATH in .env wins; then the usual install locations; then plain
+// `soffice` on the PATH. Resolved per conversion, not at startup, so
+// installing LibreOffice takes effect without restarting the server.
+const SOFFICE_CANDIDATES = [
+  'C:/Program Files/LibreOffice/program/soffice.exe',
+  'C:/Program Files (x86)/LibreOffice/program/soffice.exe',
+  '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+  '/usr/bin/soffice',
+  '/usr/local/bin/soffice',
+  '/usr/bin/libreoffice',
+  '/opt/libreoffice/program/soffice',
+  '/snap/bin/libreoffice',
+]
+
+function resolveSoffice() {
+  if (process.env.LIBREOFFICE_PATH) return process.env.LIBREOFFICE_PATH
+  return SOFFICE_CANDIDATES.find(p => fs.existsSync(p)) || 'soffice'
+}
+
+const LIBREOFFICE_MISSING =
+  'LibreOffice is not installed on the server, so this presentation cannot be ' +
+  'converted for viewing. Install LibreOffice (or set LIBREOFFICE_PATH) and retry.'
 
 // In-flight conversions keyed by cacheKey — prevents duplicate LibreOffice runs
 // and duplicate Cloudinary uploads when the same deck is requested concurrently.
@@ -51,11 +75,18 @@ async function performConversion({ buffer, ext, cacheKey }) {
 
     // 2. Document → PDF via LibreOffice (works for pptx, docx, doc, ppt, odp, odt, etc.)
     console.log('📄 Converting to PDF via LibreOffice...')
-    await execFileAsync(
-      SOFFICE,
-      ['--headless', '--convert-to', 'pdf', '--outdir', tempDir, inputPath],
-      { timeout: 120000 }
-    )
+    try {
+      await execFileAsync(
+        resolveSoffice(),
+        ['--headless', '--convert-to', 'pdf', '--outdir', tempDir, inputPath],
+        { timeout: 120000 }
+      )
+    } catch (err) {
+      // ENOENT = the executable itself was not found. Say that in words the
+      // viewer can show, rather than "spawn …/soffice.exe ENOENT".
+      if (err && err.code === 'ENOENT') throw new Error(LIBREOFFICE_MISSING)
+      throw err
+    }
 
     // LibreOffice names the PDF after the input file stem (presentation.{ext} → presentation.pdf)
     const pdfPath = path.join(tempDir, 'presentation.pdf')

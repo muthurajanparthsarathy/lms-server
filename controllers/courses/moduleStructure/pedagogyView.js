@@ -4573,7 +4573,7 @@ if (action === 'updateFolder' && folderName) {
                 continue; // uploadOriginalVideo already pushed to targetFolder.files
               } catch (fallbackErr) {
                 console.error('❌ Fallback upload also failed:', fallbackErr.message);
-                continue;
+                throw fallbackErr;
               }
             }
 
@@ -4609,7 +4609,7 @@ if (action === 'updateFolder' && folderName) {
 
           } catch (videoErr) {
             console.error('❌ Video processing failed entirely:', videoErr.message);
-            continue;
+            throw videoErr;
           }
 
         } else {
@@ -4653,7 +4653,7 @@ if (action === 'updateFolder' && folderName) {
 
           if (uploadError) {
             console.error("File upload error:", uploadError);
-            continue;
+            throw uploadError;
           }
 
           const fileUrl = publicUrlFor(storagePath);

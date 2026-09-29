@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { assignmentNotifyPlugin } = require('../../../utils/assignmentStudentNotify');
 
 // ─── TEST CASE SCHEMA ─────────────────────────────────────────────────────────
 const testCaseSchema = new mongoose.Schema(
@@ -498,6 +499,14 @@ const notificationSettingsSchema = new mongoose.Schema(
     notifyGradersSubmissions: { type: Boolean, default: false },
     notifyGradersLateSubmissions: { type: Boolean, default: false },
     notifyStudent: { type: Boolean, default: true },
+    // Which channels each notification goes out on. Declared so they survive
+    // strict mode — undeclared, every save silently dropped the trainer's
+    // Dashboard / Gmail / WhatsApp choices. No defaults on purpose: an
+    // assignment saved before these existed must read as "no channels", not
+    // as a fresh opt-in (see utils/assignmentStudentNotify.js).
+    notifyStudentChannels: { dashboard: Boolean, gmail: Boolean, whatsapp: Boolean },
+    notifyGradersSubmissionsChannels: { dashboard: Boolean, gmail: Boolean, whatsapp: Boolean },
+    notifyGradersLateSubmissionsChannels: { dashboard: Boolean, gmail: Boolean, whatsapp: Boolean },
   },
   { _id: false }
 );
@@ -1157,5 +1166,9 @@ subTopicSchema.pre("save", function (next) {
 // every listing was a collection scan.
 subTopicSchema.index({ institution: 1 });
 subTopicSchema.index({ courses: 1 });
+
+// "Assignment available" student notification — sent from the save itself,
+// so every way a We Do assignment becomes complete triggers it.
+subTopicSchema.plugin(assignmentNotifyPlugin, { entityType: 'subTopic' });
 
 module.exports = mongoose.model("SubTopic1", subTopicSchema);
