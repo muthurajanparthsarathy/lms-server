@@ -1,9 +1,10 @@
 // Daily cleanup for files created by students' programs (see
 // services/codeFileStore.js). Runs once at startup — so a server that was down
-// at midnight still clears old days — and then every day at 00:05 server time.
+// at midnight still clears old days — and then every day at 00:05 in the
+// store's time zone (CODE_FILES_TZ).
 
 const cron = require('node-cron');
-const { deleteOldDays } = require('../services/codeFileStore');
+const { deleteOldDays, TIMEZONE } = require('../services/codeFileStore');
 
 const cleanupCodeFiles = async () => {
     try {
@@ -18,7 +19,7 @@ const cleanupCodeFiles = async () => {
 
 const startCodeFilesCleanupCron = () => {
     cleanupCodeFiles();
-    cron.schedule('5 0 * * *', cleanupCodeFiles);
+    cron.schedule('5 0 * * *', cleanupCodeFiles, TIMEZONE ? { timezone: TIMEZONE } : undefined);
 };
 
 module.exports = {

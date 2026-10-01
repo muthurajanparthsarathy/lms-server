@@ -93,9 +93,15 @@ app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 // filter.
 app.use(compression());
 // Saved program output files (routes/codeFileRoutes.js) can be a few MB, above
-// the 100 KB default below. Parsing them here first makes the later json()
-// calls skip the already-parsed body.
-app.use('/api/code-files', express.json({ limit: '8mb' }));
+// the 100 KB default below: 5 MB of files, up to twice that as JSON (base64,
+// escaped quotes). Parsing them here first makes the later json() calls skip
+// the already-parsed body. A rejected body is handed to the route instead of
+// failing here, before cors() — the browser could not read that.
+const codeFilesJson = express.json({ limit: '12mb' });
+app.use('/api/code-files', (req, res, next) => codeFilesJson(req, res, (err) => {
+  if (err) { req._body = true; req.codeFilesBodyError = err; }
+  next();
+}));
 app.use(express.json({ extended: false }));
 // Allowed browser origins. The built-in list is the Vercel deployments plus
 // local dev; CORS_ORIGINS adds any others (comma-separated) so a new host does

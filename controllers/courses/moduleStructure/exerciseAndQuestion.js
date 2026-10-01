@@ -2129,6 +2129,7 @@ exports.updateExercise = async (req, res) => {
     entity.markModified(`${pedagogyPath}.${tabType}.${subcategory}.${exerciseIndex}`);
     entity.markModified(`${pedagogyPath}.${tabType}.${subcategory}.${exerciseIndex}.availabilityPeriod`);
     entity.markModified(`${pedagogyPath}.${tabType}.${subcategory}.${exerciseIndex}.approvalWorkflow`);
+    entity.markModified(`${pedagogyPath}.${tabType}.${subcategory}.${exerciseIndex}.evaluationMethod`);
     // customDistributionBySection is a Mixed type (dynamic section-id keys).
     // Mongoose can't auto-detect deep changes on Mixed fields, so without an
     // explicit markModified the update payload is written into memory but

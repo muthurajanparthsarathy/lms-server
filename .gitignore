@@ -48,3 +48,6 @@ Thumbs.db
 # Backup archives written by System Settings > Backup (local destination).
 # These contain full copies of live client, user and course data.
 backups/
+
+# Files students' programs create in the multi-file editor (private, kept one day).
+code-files/

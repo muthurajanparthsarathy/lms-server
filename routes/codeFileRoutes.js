@@ -10,7 +10,9 @@
 // older days. See services/codeFileStore.js for the layout and limits.
 //
 // The JSON body limit for PUT is raised in server.js, ahead of the global
-// 100 KB express.json().
+// 100 KB express.json(); a body it rejects arrives here as
+// req.codeFilesBodyError so the answer passes through cors() and the browser
+// can read it.
 
 const express = require('express');
 const { userAuth } = require('../middlewares/userAuth');
@@ -25,8 +27,9 @@ router.get('/code-files', userAuth, async (req, res) => {
   if (!questionId) return res.status(400).json({ error: 'A valid questionId is required.' });
 
   try {
+    const date = store.todayKey();
     const files = await store.listFiles(userId, questionId);
-    return res.json({ date: store.todayKey(), files });
+    return res.json({ date, files });
   } catch (e) {
     console.error('code-files list error:', e);
     return res.status(500).json({ error: 'Could not read saved files.' });
@@ -34,10 +37,21 @@ router.get('/code-files', userAuth, async (req, res) => {
 });
 
 router.put('/code-files', userAuth, async (req, res) => {
+  const bodyError = req.codeFilesBodyError;
+  if (bodyError) {
+    return bodyError.status === 413
+      ? res.status(413).json({ error: 'Output files are too large to save (5 MB per question).' })
+      : res.status(400).json({ error: 'Invalid request body.' });
+  }
   const userId = store.safeId(req.user?._id);
   const questionId = store.safeId(req.body?.questionId);
   if (!userId) return res.status(401).json({ error: 'Not signed in.' });
   if (!questionId) return res.status(400).json({ error: 'A valid questionId is required.' });
+  // `date` is the day the run's files were loaded for. A run that started
+  // yesterday must not carry yesterday's files into today.
+  if (req.body?.date && req.body.date !== store.todayKey()) {
+    return res.status(409).json({ error: 'The day changed while the program ran; its files are only kept for one day.' });
+  }
 
   const prepared = store.prepareFiles(req.body?.files);
   if (prepared.error) return res.status(prepared.status).json({ error: prepared.error });

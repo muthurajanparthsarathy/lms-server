@@ -12,6 +12,7 @@ const StudentQuestionActivity = require("../../../models/Courses/moduleStructure
 const ProctorMessage = require("../../../models/Courses/moduleStructure/ProctorMessageModel");
 const { pocCourseFilter } = require("../../../utils/pocScope");
 const { isStudentUser } = require("../../../utils/batchResources");
+const assignmentPresence = require("../../../utils/assignmentPresence");
 
 // A batch's `users[]` is NOT a student list. Enrolling staff there is
 // deliberate — a trainer serves several batches and attendance's role
@@ -176,23 +177,35 @@ function findPersistedExerciseEntry(user, courseId, exerciseId, category) {
   return null;
 }
 
-// Is this stored exercise entry finished?
+// Has the learner finished this We Do assignment?
 //
-// Mirrors the client's `isParentDocSubmitted` (computeStudentMarks.ts) on
-// purpose: the dashboard's Marks column already treats these states as "this
-// learner has finished", so Test Status has to agree or one row contradicts
-// itself. `status: 'completed'` / `testSubmissions` are what a full Submit
-// writes (answer.js), and the per-question fallback covers assignments a
-// learner completes question-by-question without a final Submit Test.
+// Finishing is the full submit — the editor's Finish button posts
+// `isTestSubmission`, which marks the entry `completed` and counts a test
+// submission (answer.js). A single submitted question is NOT finished: the
+// multi-file editor stores an answer on every per-question Submit (and on
+// Run Testcase under Test Case grading), so "any answered question" used to
+// read as Completed while the learner was still working on the rest.
+//
+// The SQL editor (programmingSettings.selectedModule "Database") is the one
+// We Do editor with no Finish button, so there answering every question of
+// the exercise is what finishing means.
 const TERMINAL_QUESTION_STATUSES = new Set(["solved", "submitted", "evaluated", "completed"]);
 
-function isEntrySubmitted(entry) {
+function isAssignmentFinished(entry, exercise) {
   if (!entry) return false;
   if (String(entry.status || "").toLowerCase() === "completed") return true;
   if ((entry.testSubmissions || 0) > 0) return true;
-  return (entry.questions || []).some(
-    (q) => q && TERMINAL_QUESTION_STATUSES.has(String(q.status || "").toLowerCase())
+  if (exercise?.programmingSettings?.selectedModule !== "Database") return false;
+  const questionIds = (exercise.questions || [])
+    .map((q) => q && q._id && q._id.toString())
+    .filter(Boolean);
+  if (!questionIds.length) return false;
+  const answered = new Set(
+    (entry.questions || [])
+      .filter((q) => q && q.questionId && TERMINAL_QUESTION_STATUSES.has(String(q.status || "").toLowerCase()))
+      .map((q) => q.questionId.toString())
   );
+  return questionIds.every((id) => answered.has(id));
 }
 
 // Seed a student's progress from persisted answers (best-known state before live events).
@@ -480,16 +493,28 @@ exports.getLiveDashboard = async (req, res) => {
     // assignment never opens an ExamSession at all, so that rule would pin
     // every assignment row to "Started" forever. For We_Do — and ONLY We_Do,
     // so You Do keeps its stricter rule — the stored answer doc is the
-    // authority.
+    // authority, and only a finished assignment counts (isAssignmentFinished).
     //
     // Only the finished case is set. Leaving `attemptStatus` off otherwise
     // lets the client's existing fallbacks decide between Started (some
     // questions answered) and Not Started, which is already correct here.
-    ...(resolvedCategory === "We_Do" && isEntrySubmitted(entry)
+    ...(resolvedCategory === "We_Do" && isAssignmentFinished(entry, exercise)
       ? { attemptStatus: "submitted" }
       : {}),
   };
 });
+
+    // We Do — a learner with the assignment editor open right now is
+    // attending, whatever their stored answers say. The client reads
+    // `inProgress` as "Started" ahead of any stored completion.
+    if (resolvedCategory === "We_Do") {
+      for (const row of students) {
+        if (assignmentPresence.isAttending(assessmentId, row.id)) {
+          row.inProgress = true;
+          row.isOnline = true;
+        }
+      }
+    }
 
     return res.status(200).json({
       assessmentName,
@@ -503,6 +528,27 @@ exports.getLiveDashboard = async (req, res) => {
     console.error("getLiveDashboard error:", err);
     return res.status(500).json({ message: [{ key: "error", value: `Internal server error: ${err.message}` }] });
   }
+};
+
+// One learner's stored We Do row, by the same rules getLiveDashboard applies.
+// The socket layer broadcasts it when a learner leaves the assignment editor,
+// so the row drops from "Started" to what they actually left behind — answers
+// in progress, or the finished assignment — without the trainer refreshing.
+exports.assignmentRowState = async ({ assessmentId, studentId, courseId, nodeId, nodeType }) => {
+  if (!assessmentId || !studentId || !courseId) return null;
+  const resolved = await resolveExercise(assessmentId, nodeType, nodeId, "We_Do");
+  if (!resolved || resolved.category !== "We_Do") return null;
+  const user = await User.findById(studentId).select("courses").lean();
+  const entry = user ? findPersistedExerciseEntry(user, courseId, assessmentId, "We_Do") : null;
+  const seed = seedProgressFromAnswers(entry, totalQuestionsOf(resolved.exercise));
+  return {
+    completed: seed.completed,
+    yetToComplete: seed.yetToComplete,
+    notAttempted: seed.notAttempted,
+    completionPercent: seed.completionPercent,
+    submitted: seed.submitted,
+    ...(isAssignmentFinished(entry, resolved.exercise) ? { attemptStatus: "submitted" } : {}),
+  };
 };
 
 // ─── GET /api/assessment/student-details ─────────────────────────────────────

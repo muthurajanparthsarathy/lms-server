@@ -6,6 +6,15 @@
 const ExamSession = require("../models/Courses/moduleStructure/ExamSessionModel");
 const StudentQuestionActivity = require("../models/Courses/moduleStructure/StudentQuestionActivityModel");
 const User = require("../models/UserModel");
+const assignmentPresence = require("./assignmentPresence");
+// The stored-answer rules for a We Do row live with the dashboard GET.
+// Required lazily, like the attempt gate below, so this module never loads
+// the controller at boot.
+let _dashboard = null;
+function dashboardController() {
+  if (!_dashboard) _dashboard = require("../controllers/courses/moduleStructure/liveDashboard");
+  return _dashboard;
+}
 // Arm the resume-permission gate the moment a student's grace-flip fires.
 // Imported lazily to avoid a require-cycle on server boot.
 let _attemptGate = null;
@@ -83,8 +92,76 @@ async function getOrCreateSession(assessmentId, studentId, patch = {}) {
   } else {
     Object.assign(session, patch);
   }
+  // A submitted / terminated attempt cannot be resumed, so re-opening its page
+  // (which re-emits student:joined) must not mark it attending again — the
+  // dashboard reads `inProgress` as "Started" ahead of "Completed".
+  if (session.submittedAt || (session.status && session.status !== "active")) {
+    session.inProgress = false;
+  }
   await session.save();
   return session;
+}
+
+// ─── We Do assignment presence (see assignmentPresence.js) ─────────────────
+//   • close grace      — the editor unmounted (Back, Finish). Short: it only
+//                        absorbs a remount, e.g. React's dev double-mount.
+//   • disconnect grace — the socket dropped (reload, flaky Wi-Fi). Long
+//                        enough for the page to come back and re-announce.
+//   • stale            — an open editor re-announces every 25 s (a background
+//                        tab's timers may slow that to once a minute), so a
+//                        tab silent this long is gone even without a
+//                        disconnect.
+const ASSIGNMENT_CLOSE_GRACE_MS = 3 * 1000;
+const ASSIGNMENT_DISCONNECT_GRACE_MS = 15 * 1000;
+const ASSIGNMENT_STALE_MS = 150 * 1000;
+
+// The socket's own authenticated id wins; the payload id is the fallback for
+// a socket that connected before the learner's token was stored.
+function assignmentStudentId(socket, payload) {
+  return String(socket.userId || (payload && payload.studentId) || "");
+}
+
+// After the grace, if no tab has the editor open again, drop the learner and
+// send the dashboards their stored row — answers in progress, or the
+// finished assignment — so "Started" falls back to what they actually left.
+function scheduleAssignmentLeave(io, entry, delayMs) {
+  if (entry.leaveTimer) clearTimeout(entry.leaveTimer);
+  entry.leaveTimer = setTimeout(async () => {
+    entry.leaveTimer = null;
+    if (entry.sockets.size > 0) return;
+    assignmentPresence.remove(entry);
+    let stored = null;
+    try {
+      stored = await dashboardController().assignmentRowState(entry);
+    } catch (e) {
+      console.error("assignment leave state error:", e.message);
+    }
+    // Re-opened while the stored state was loading — that open already told
+    // the dashboards "Started"; don't overwrite it.
+    if (assignmentPresence.isAttending(entry.assessmentId, entry.studentId)) return;
+    io.to(room(entry.assessmentId)).emit("dashboard:student_update", {
+      studentId: entry.studentId,
+      ...(stored || {}),
+      inProgress: false,
+      isOnline: false,
+      lastActivity: fmtActivity(new Date()),
+    });
+  }, delayMs);
+}
+
+let assignmentSweepStarted = false;
+function startAssignmentPresenceSweep(io) {
+  if (assignmentSweepStarted) return;
+  assignmentSweepStarted = true;
+  setInterval(() => {
+    const cutoff = Date.now() - ASSIGNMENT_STALE_MS;
+    for (const entry of assignmentPresence.all()) {
+      for (const [socketId, seenAt] of entry.sockets) {
+        if (seenAt < cutoff) entry.sockets.delete(socketId);
+      }
+      if (entry.sockets.size === 0 && !entry.leaveTimer) scheduleAssignmentLeave(io, entry, 0);
+    }
+  }, 30 * 1000);
 }
 
 // Recompute completed/notAttempted from per-question activity, persist, broadcast.
@@ -188,6 +265,7 @@ function registerLiveDashboardHandlers(io, socket) {
   // first place we have a reference to `io`. Guarded by expirySweepStarted so
   // subsequent connections don't stack intervals.
   startExpirySweep(io);
+  startAssignmentPresenceSweep(io);
 
   // ── Teacher rooms ──────────────────────────────────────────────────────────
   socket.on("teacher:join_dashboard", ({ assessmentId }) => {
@@ -326,10 +404,52 @@ function registerLiveDashboardHandlers(io, socket) {
       }
 
       io.to(room(assessmentId)).emit("dashboard:student_update", {
-        studentId, inProgress: true, lastActivity: fmtActivity(session.lastActivityAt),
+        studentId, inProgress: session.inProgress, lastActivity: fmtActivity(session.lastActivityAt),
       });
     } catch (e) {
       console.error("student:question_changed error:", e.message);
+    }
+  });
+
+  // ── We Do assignment editor open (also its 25 s heartbeat) ─────────────────
+  // A We Do assignment has no ExamSession; the editor reports itself here so
+  // the dashboard shows the learner as Started while they work.
+  socket.on("student:assignment_open", (payload = {}) => {
+    try {
+      const assessmentId = String(payload.assessmentId || "");
+      const studentId = assignmentStudentId(socket, payload);
+      if (!assessmentId || !studentId) return;
+      const wasAttending = assignmentPresence.isAttending(assessmentId, studentId);
+      assignmentPresence.touch(assessmentId, studentId, socket.id, payload);
+      socket.data = socket.data || {};
+      socket.data.assignments = socket.data.assignments || new Map();
+      socket.data.assignments.set(`${assessmentId}:${studentId}`, { assessmentId, studentId });
+      // Repeated on every heartbeat, so a dashboard that joined after the
+      // first announcement still catches up.
+      io.to(room(assessmentId)).emit("dashboard:student_update", {
+        studentId,
+        inProgress: true,
+        isOnline: true,
+        ...(wasAttending ? {} : { lastActivity: fmtActivity(new Date()) }),
+      });
+    } catch (e) {
+      console.error("student:assignment_open error:", e.message);
+    }
+  });
+
+  // ── We Do assignment editor closed (Back / Finish / navigated away) ────────
+  socket.on("student:assignment_close", (payload = {}) => {
+    try {
+      const assessmentId = String(payload.assessmentId || "");
+      const studentId = assignmentStudentId(socket, payload);
+      if (!assessmentId || !studentId) return;
+      if (socket.data && socket.data.assignments) {
+        socket.data.assignments.delete(`${assessmentId}:${studentId}`);
+      }
+      const left = assignmentPresence.release(assessmentId, studentId, socket.id);
+      if (left) scheduleAssignmentLeave(io, left, ASSIGNMENT_CLOSE_GRACE_MS);
+    } catch (e) {
+      console.error("student:assignment_close error:", e.message);
     }
   });
 
@@ -380,6 +500,12 @@ function registerLiveDashboardHandlers(io, socket) {
   // assessment), `studentContext` is undefined and the helper no-ops.
   socket.on("disconnect", async () => {
     try {
+      // We Do editors this tab had open — a reload gets the grace to return.
+      const assignments = socket.data && socket.data.assignments;
+      for (const { assessmentId, studentId } of assignments ? assignments.values() : []) {
+        const left = assignmentPresence.release(assessmentId, studentId, socket.id);
+        if (left) scheduleAssignmentLeave(io, left, ASSIGNMENT_DISCONNECT_GRACE_MS);
+      }
       const ctx = socket.data && socket.data.studentContext;
       if (!ctx) return;
       await scheduleOfflineFlip(io, ctx.assessmentId, ctx.studentId);

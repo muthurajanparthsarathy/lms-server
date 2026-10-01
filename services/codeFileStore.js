@@ -3,13 +3,15 @@
 //
 // Layout:  <root>/<YYYY-MM-DD>/<userId>/<questionId>/<relative path>
 //
-// Everything is bucketed by the server's LOCAL date so the daily cleanup
+// Everything is bucketed by the date in CODE_FILES_TZ (default Asia/Kolkata,
+// where the students are — the API host may run on UTC), so the daily cleanup
 // (cron/codeFilesCleanup.js) only has to delete whole date folders older than
 // today. Reads only ever look at today's folder, so yesterday's files are gone
 // for the student from midnight even if the cleanup has not run yet.
 //
 // The root is deliberately NOT under server/uploads: that folder is served
-// publicly by express.static, and these are private student files.
+// publicly by express.static, and these are private student files. It is
+// ignored by nodemon (nodemon.json) and git (.gitignore).
 
 const fs = require('fs');
 const path = require('path');
@@ -19,20 +21,37 @@ const ROOT = path.resolve(process.env.CODE_FILES_DIR || path.join(__dirname, '..
 const MAX_FILES = 100;
 const MAX_FILE_BYTES = 1024 * 1024;       // 1 MB per file
 const MAX_TOTAL_BYTES = 5 * 1024 * 1024;  // 5 MB per student per question
-// questionId is only checked for shape, so cap a student's whole day too.
+// questionId is only checked for shape, so cap a student's whole day too —
+// in bytes and in files + folders (empty files cost no bytes).
 const MAX_USER_DAY_BYTES = 50 * 1024 * 1024;
+const MAX_USER_DAY_ENTRIES = 5000;
 const MAX_PATH_LENGTH = 200;
 const MAX_DEPTH = 10;
 
 const DATE_DIR = /^\d{4}-\d{2}-\d{2}$/;
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i;
 const BAD_CHARS = /[<>:"|?*\\\u0000-\u001f]/;
+// "LONGFI~1.TXT" can open another file through its 8.3 short name on NTFS.
+const SHORT_NAME = /~\d+(\.|$)/;
+// Control characters other than tab/newline/CR: such files travel as base64
+// (JSON would escape each byte to six). Keep in step with the client runner.
+const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 
+const TIMEZONE = (() => {
+  const tz = process.env.CODE_FILES_TZ || 'Asia/Kolkata';
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: tz });
+    return tz;
+  } catch (e) {
+    console.error(`CODE_FILES_TZ "${tz}" is not a valid time zone; using the server's local time.`);
+    return undefined;
+  }
+})();
+const dayFormat = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+
+// YYYY-MM-DD ("en-CA" formats dates that way).
 function todayKey(now = new Date()) {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+  return dayFormat.format(now);
 }
 
 // Ids become folder names, so keep them to a safe alphabet.
@@ -53,7 +72,9 @@ function cleanSegments(rawPath) {
   for (const seg of segments) {
     if (!seg || seg === '.' || seg === '..') return { error: 'invalid path' };
     if (BAD_CHARS.test(seg)) return { error: 'name contains characters not allowed in file names' };
-    if (WINDOWS_RESERVED.test(seg) || /[. ]$/.test(seg)) return { error: 'name is not allowed as a file name' };
+    if (WINDOWS_RESERVED.test(seg) || /[. ]$/.test(seg) || SHORT_NAME.test(seg)) {
+      return { error: 'name is not allowed as a file name' };
+    }
   }
   return { segments };
 }
@@ -68,15 +89,15 @@ function resolveInside(base, segments) {
   return full.startsWith(base + path.sep) ? full : null;
 }
 
-// A buffer round-trips as UTF-8 text only if decoding then re-encoding gives the
-// same bytes; anything else (images, pickles, …) travels as base64.
+// Plain text round-trips as UTF-8; anything else (images, pickles, NUL-padded
+// data, …) travels as base64.
 function encodeForClient(buf) {
   const text = buf.toString('utf8');
-  if (Buffer.from(text, 'utf8').equals(buf)) return { content: text, encoding: 'utf8' };
+  if (Buffer.from(text, 'utf8').equals(buf) && !CONTROL_CHARS.test(text)) return { content: text, encoding: 'utf8' };
   return { content: buf.toString('base64'), encoding: 'base64' };
 }
 
-async function walk(dir, rel, out) {
+async function walk(dir, rel, out, dirs) {
   let entries;
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -87,23 +108,47 @@ async function walk(dir, rel, out) {
   for (const entry of entries) {
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) await walk(full, childRel, out);
-    else if (entry.isFile()) out.push({ path: childRel, full });
+    if (entry.isDirectory()) {
+      if (dirs) dirs.count += 1;
+      await walk(full, childRel, out, dirs);
+    } else if (entry.isFile()) out.push({ path: childRel, full });
   }
   return out;
 }
 
+// Bytes and entries (files + folders) under dir.
+async function usage(dir) {
+  const dirs = { count: 0 };
+  const files = await walk(dir, '', [], dirs);
+  let bytes = 0;
+  for (const f of files) bytes += (await fs.promises.stat(f.full)).size;
+  return { bytes, entries: files.length + dirs.count };
+}
+
+// Serialise saves and reads per student, so a read never sees a save half
+// done and two saves cannot both slip under the daily caps.
+const locks = new Map();
+function withLock(key, fn) {
+  const prev = locks.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  locks.set(key, next);
+  next.finally(() => { if (locks.get(key) === next) locks.delete(key); }).catch(() => {});
+  return next;
+}
+
 // Today's saved files for one student + question, with contents.
-async function listFiles(userId, questionId) {
-  const base = questionDir(userId, questionId);
-  const found = await walk(base, '', []);
-  found.sort((a, b) => a.path.localeCompare(b.path));
-  const files = [];
-  for (const f of found) {
-    const buf = await fs.promises.readFile(f.full);
-    files.push({ path: f.path, size: buf.length, ...encodeForClient(buf) });
-  }
-  return files;
+function listFiles(userId, questionId) {
+  return withLock(userId, async () => {
+    const base = questionDir(userId, questionId);
+    const found = await walk(base, '', []);
+    found.sort((a, b) => a.path.localeCompare(b.path));
+    const files = [];
+    for (const f of found) {
+      const buf = await fs.promises.readFile(f.full);
+      files.push({ path: f.path, size: buf.length, ...encodeForClient(buf) });
+    }
+    return files;
+  });
 }
 
 // Check and decode an incoming file list without touching the disk.
@@ -149,47 +194,68 @@ function prepareFiles(files) {
   return { accepted: clean, skipped };
 }
 
-async function dirBytes(dir) {
-  let total = 0;
-  for (const f of await walk(dir, '', [])) total += (await fs.promises.stat(f.full)).size;
-  return total;
-}
-
-// Serialise writes per student so two overlapping saves can neither
-// interleave their delete-then-write steps nor both slip under the daily cap.
-const locks = new Map();
-function withLock(key, fn) {
-  const prev = locks.get(key) || Promise.resolve();
-  const next = prev.catch(() => {}).then(fn);
-  locks.set(key, next);
-  next.finally(() => { if (locks.get(key) === next) locks.delete(key); }).catch(() => {});
-  return next;
+function quotaError(message) {
+  const err = new Error(message);
+  err.code = 'QUOTA';
+  return err;
 }
 
 // Make today's folder hold exactly `accepted` (the program's files at the end
-// of its run), so files the program deleted or renamed disappear too.
-// Rejects with err.code === 'QUOTA' (nothing changed) past the daily cap.
+// of its run), so files the program deleted or renamed disappear too. The new
+// set is written to a side folder and swapped in, so a failure part-way keeps
+// the previous set. Rejects with err.code === 'QUOTA' (nothing changed) past a
+// daily cap.
 function replaceFiles(userId, questionId, accepted) {
   return withLock(userId, async () => {
     const date = todayKey();
     const base = questionDir(userId, questionId, date);
-    const incoming = accepted.reduce((n, a) => n + a.buf.length, 0);
-    const elsewhere = (await dirBytes(path.join(ROOT, date, userId))) - (await dirBytes(base));
-    if (elsewhere + incoming > MAX_USER_DAY_BYTES) {
-      const err = new Error('Daily storage limit for program files reached (50 MB). They are cleared at midnight.');
-      err.code = 'QUOTA';
-      throw err;
-    }
-    await fs.promises.rm(base, { recursive: true, force: true });
-    if (!accepted.length) return [];
-    await fs.promises.mkdir(base, { recursive: true });
-    const saved = [];
+    const day = await usage(path.join(ROOT, date, userId));
+    const mine = await usage(base);
+    const incomingBytes = accepted.reduce((n, a) => n + a.buf.length, 0);
+    const incomingDirs = new Set();
     for (const a of accepted) {
-      const full = resolveInside(base, a.segments);
-      if (!full) continue;
-      await fs.promises.mkdir(path.dirname(full), { recursive: true });
-      await fs.promises.writeFile(full, a.buf);
-      saved.push({ path: a.path, size: a.buf.length });
+      for (let i = 1; i < a.segments.length; i++) incomingDirs.add(a.segments.slice(0, i).join('/').toLowerCase());
+    }
+    if (day.bytes - mine.bytes + incomingBytes > MAX_USER_DAY_BYTES) {
+      throw quotaError('Daily storage limit for program files reached (50 MB). They are cleared at midnight.');
+    }
+    if (day.entries - mine.entries + accepted.length + incomingDirs.size > MAX_USER_DAY_ENTRIES) {
+      throw quotaError(`Daily limit of ${MAX_USER_DAY_ENTRIES} program files and folders reached. They are cleared at midnight.`);
+    }
+
+    if (!accepted.length) {
+      await fs.promises.rm(base, { recursive: true, force: true });
+      return [];
+    }
+
+    const stamp = `${process.pid}-${Date.now()}`;
+    const staging = `${base}.saving-${stamp}`;
+    const saved = [];
+    try {
+      for (const a of accepted) {
+        const full = resolveInside(staging, a.segments);
+        if (!full) continue;
+        await fs.promises.mkdir(path.dirname(full), { recursive: true });
+        await fs.promises.writeFile(full, a.buf);
+        saved.push({ path: a.path, size: a.buf.length });
+      }
+      const old = `${base}.old-${stamp}`;
+      let moved = false;
+      try {
+        await fs.promises.rename(base, old);
+        moved = true;
+      } catch (e) {
+        if (e.code !== 'ENOENT') {
+          // Windows can refuse to rename a folder with an open handle
+          // (antivirus, indexer): fall back to deleting it first.
+          await fs.promises.rm(base, { recursive: true, force: true });
+        }
+      }
+      await fs.promises.rename(staging, base);
+      if (moved) await fs.promises.rm(old, { recursive: true, force: true });
+    } catch (e) {
+      await fs.promises.rm(staging, { recursive: true, force: true }).catch(() => {});
+      throw e;
     }
     return saved;
   });
@@ -216,6 +282,7 @@ async function deleteOldDays(now = new Date()) {
 
 module.exports = {
   ROOT,
+  TIMEZONE,
   MAX_FILES,
   MAX_FILE_BYTES,
   MAX_TOTAL_BYTES,
